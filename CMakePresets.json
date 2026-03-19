@@ -1,0 +1,37 @@
+{
+  "version": 8,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-x64-local-obs",
+      "displayName": "Windows x64 (Local OBS)",
+      "description": "Configure nowplaylisting against sibling ../obs-studio build outputs.",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "libobs_DIR": "${sourceDir}/../obs-studio/build_x64_local/libobs",
+        "w32-pthreads_DIR": "${sourceDir}/../obs-studio/build_x64_local/deps/w32-pthreads",
+        "CMAKE_MODULE_PATH": "${sourceDir}/../obs-studio/cmake/finders",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../obs-studio/.deps/obs-deps-2025-08-23-x64"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64-local-obs-relwithdebinfo",
+      "displayName": "Build RelWithDebInfo (Local OBS)",
+      "configurePreset": "windows-x64-local-obs",
+      "configuration": "RelWithDebInfo"
+    }
+  ]
+}
