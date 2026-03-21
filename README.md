@@ -21,7 +21,9 @@
   - Plays video only (no metadata text overlay).
 - Source output canvas defaults to `480x480` (`1:1`), with media fit-to-edge scaling that preserves media aspect ratio and leaves unused area transparent.
 - Text style controls:
-  - Font (includes size), color, outline color/size, diffuse glow color/size, X/Y offsets.
+  - Font (includes size), color, outline color/size, shadow color/size, X/Y offsets.
+- Text font size values are internally scaled by `3x` for this source so practical on-screen sizing maps to more typical UI font numbers.
+- Source properties update live while editing (no `OK` required to preview most changes).
 
 ## Build
 
@@ -52,3 +54,4 @@ Install layout is configured for OBS plugin paths:
 4. Add `Artist` and `Title` columns to the playlist UI.
 5. Persist extracted metadata in playlist storage when new items are added, and make playlist `Artist`/`Title` cells editable with changes saved.
 6. During playback, use `Artist`/`Title` from the saved playlist metadata first (not direct shell extraction each time), with shell extraction only as import/default behavior.
+7. In the listview rework, add a per-track `Show Tags` checkbox that controls whether artist/title text is rendered for that specific track during playback.

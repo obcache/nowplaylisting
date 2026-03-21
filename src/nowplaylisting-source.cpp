@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
-#include <cmath>
 #include <filesystem>
 #include <numeric>
 #include <optional>
@@ -56,9 +55,10 @@ constexpr uint32_t kDefaultOutlineColor = 0x000000;
 constexpr int kDefaultOutlineSize = 4;
 constexpr uint32_t kDefaultGlowColor = 0x000000;
 constexpr int kDefaultGlowSize = 0;
-constexpr int kDefaultGlowOpacity = 35;
+constexpr int kDefaultGlowOpacity = 25;
 constexpr int kDefaultOffset = 0;
 constexpr int kDefaultFontSize = 96;
+constexpr int kFontSizeScaleMultiplier = 3;
 constexpr float kDefaultTitleGap = 12.0f;
 constexpr const char *kMediaFileFilter =
 	"Media Files (*.mp3 *.wav *.aiff *.aif *.mp4 *.mpg *.mpeg *.mkv *.avi);;All Files (*.*)";
@@ -697,6 +697,34 @@ void update_album_art_source(nowplaylist_source *source)
 	obs_source_set_enabled(source->album_art_source, enabled);
 }
 
+obs_data_t *create_scaled_font_settings(const nowplaylist_source *source)
+{
+	if (!source || !source->font_settings)
+		return nullptr;
+
+	obs_data_t *font = obs_data_create();
+
+	const char *face = obs_data_get_string(source->font_settings, "face");
+	if (face && *face)
+		obs_data_set_string(font, "face", face);
+
+	const char *style = obs_data_get_string(source->font_settings, "style");
+	if (style && *style)
+		obs_data_set_string(font, "style", style);
+
+	int64_t size = obs_data_get_int(source->font_settings, "size");
+	if (size <= 0)
+		size = kDefaultFontSize;
+	size *= static_cast<int64_t>(kFontSizeScaleMultiplier);
+	size = std::clamp<int64_t>(size, 1, 10000);
+	obs_data_set_int(font, "size", size);
+
+	const int64_t flags = obs_data_get_int(source->font_settings, "flags");
+	obs_data_set_int(font, "flags", flags);
+
+	return font;
+}
+
 void update_text_source_style(obs_source_t *text_source, const std::string &text, const nowplaylist_source *source)
 {
 	if (!text_source)
@@ -704,8 +732,11 @@ void update_text_source_style(obs_source_t *text_source, const std::string &text
 
 	obs_data_t *settings = obs_data_create();
 	obs_data_set_string(settings, "text", text.c_str());
-	if (source->font_settings)
-		obs_data_set_obj(settings, "font", source->font_settings);
+	obs_data_t *scaled_font = create_scaled_font_settings(source);
+	if (scaled_font) {
+		obs_data_set_obj(settings, "font", scaled_font);
+		obs_data_release(scaled_font);
+	}
 	obs_data_set_int(settings, "color", source->text_color);
 	obs_data_set_int(settings, "opacity", 100);
 	obs_data_set_bool(settings, "outline", source->outline_size > 0);
@@ -725,14 +756,17 @@ void update_glow_source_style(obs_source_t *text_source, const std::string &text
 
 	obs_data_t *settings = obs_data_create();
 	obs_data_set_string(settings, "text", text.c_str());
-	if (source->font_settings)
-		obs_data_set_obj(settings, "font", source->font_settings);
+	obs_data_t *scaled_font = create_scaled_font_settings(source);
+	if (scaled_font) {
+		obs_data_set_obj(settings, "font", scaled_font);
+		obs_data_release(scaled_font);
+	}
 	obs_data_set_int(settings, "color", source->glow_color);
 	obs_data_set_int(settings, "opacity", kDefaultGlowOpacity);
-	obs_data_set_bool(settings, "outline", false);
-	obs_data_set_int(settings, "outline_size", 0);
+	obs_data_set_bool(settings, "outline", true);
+	obs_data_set_int(settings, "outline_size", std::max(source->outline_size, 0));
 	obs_data_set_int(settings, "outline_color", source->glow_color);
-	obs_data_set_int(settings, "outline_opacity", 0);
+	obs_data_set_int(settings, "outline_opacity", 100);
 	obs_data_set_string(settings, "align", "center");
 	obs_data_set_string(settings, "valign", "top");
 	obs_source_update(text_source, settings);
@@ -946,22 +980,23 @@ void render_diffuse_glow(obs_source_t *glow_source, float x, float y, int glow_s
 	if (!glow_source || glow_size <= 0)
 		return;
 
-	render_source_at(glow_source, x, y);
+	const int radius = std::clamp(glow_size, 1, 12);
+	const int step = radius > 8 ? 2 : 1;
 
-	const float radius = static_cast<float>(std::max(glow_size, 1));
-	const int rings = std::clamp((glow_size + 5) / 6, 1, 3);
+	for (int dy = -radius; dy <= radius; dy += step) {
+		for (int dx = -radius; dx <= radius; dx += step) {
+			if (dx == 0 && dy == 0)
+				continue;
 
-	for (int ring = 1; ring <= rings; ++ring) {
-		const float ring_radius = radius * (static_cast<float>(ring) / static_cast<float>(rings));
-		const int samples = 8 + ring * 6;
+			const int dist_sq = dx * dx + dy * dy;
+			if (dist_sq > radius * radius)
+				continue;
 
-		for (int i = 0; i < samples; ++i) {
-			const float angle = (2.0f * 3.14159265f * static_cast<float>(i)) / static_cast<float>(samples);
-			const float dx = std::cos(angle) * ring_radius;
-			const float dy = std::sin(angle) * ring_radius;
-			render_source_at(glow_source, x + dx, y + dy);
+			render_source_at(glow_source, x + static_cast<float>(dx), y + static_cast<float>(dy));
 		}
 	}
+
+	render_source_at(glow_source, x, y);
 }
 
 void render_centered_text(nowplaylist_source *source, uint32_t target_width, uint32_t target_height)
@@ -969,17 +1004,34 @@ void render_centered_text(nowplaylist_source *source, uint32_t target_width, uin
 	struct line_info {
 		obs_source_t *glow_source;
 		obs_source_t *text_source;
-		uint32_t width;
-		uint32_t height;
+		uint32_t glow_width;
+		uint32_t glow_height;
+		uint32_t text_width;
+		uint32_t text_height;
 	};
 
 	std::vector<line_info> lines;
-	if (source->artist_source && !source->current_artist.empty())
-		lines.push_back({source->artist_glow_source, source->artist_source, obs_source_get_width(source->artist_source),
-				 obs_source_get_height(source->artist_source)});
-	if (source->title_source && !source->current_title.empty())
-		lines.push_back({source->title_glow_source, source->title_source, obs_source_get_width(source->title_source),
-				 obs_source_get_height(source->title_source)});
+	if (source->artist_source && !source->current_artist.empty()) {
+		const uint32_t text_width = obs_source_get_width(source->artist_source);
+		const uint32_t text_height = obs_source_get_height(source->artist_source);
+		const uint32_t glow_width =
+			source->artist_glow_source ? obs_source_get_width(source->artist_glow_source) : text_width;
+		const uint32_t glow_height =
+			source->artist_glow_source ? obs_source_get_height(source->artist_glow_source) : text_height;
+		lines.push_back(
+			{source->artist_glow_source, source->artist_source, glow_width, glow_height, text_width, text_height});
+	}
+
+	if (source->title_source && !source->current_title.empty()) {
+		const uint32_t text_width = obs_source_get_width(source->title_source);
+		const uint32_t text_height = obs_source_get_height(source->title_source);
+		const uint32_t glow_width =
+			source->title_glow_source ? obs_source_get_width(source->title_glow_source) : text_width;
+		const uint32_t glow_height =
+			source->title_glow_source ? obs_source_get_height(source->title_glow_source) : text_height;
+		lines.push_back(
+			{source->title_glow_source, source->title_source, glow_width, glow_height, text_width, text_height});
+	}
 
 	if (lines.empty())
 		return;
@@ -989,17 +1041,22 @@ void render_centered_text(nowplaylist_source *source, uint32_t target_width, uin
 
 	float total_height = 0.0f;
 	for (const auto &line : lines)
-		total_height += static_cast<float>(line.height);
+		total_height += static_cast<float>(line.text_height);
 	total_height += gap * static_cast<float>(lines.size() - 1);
 
 	float y = (static_cast<float>(target_height) - total_height) * 0.5f + static_cast<float>(source->offset_y);
 	for (const auto &line : lines) {
-		const float x = (static_cast<float>(target_width) - static_cast<float>(line.width)) * 0.5f +
-				static_cast<float>(source->offset_x);
+		const float text_x = (static_cast<float>(target_width) - static_cast<float>(line.text_width)) * 0.5f +
+				     static_cast<float>(source->offset_x);
+		const float text_y = y;
+		const float glow_x =
+			text_x + (static_cast<float>(line.text_width) - static_cast<float>(line.glow_width)) * 0.5f;
+		const float glow_y =
+			text_y + (static_cast<float>(line.text_height) - static_cast<float>(line.glow_height)) * 0.5f;
 		if (source->glow_size > 0 && line.glow_source)
-			render_diffuse_glow(line.glow_source, x, y, source->glow_size);
-		render_source_at(line.text_source, x, y);
-		y += static_cast<float>(line.height) + gap;
+			render_diffuse_glow(line.glow_source, glow_x, glow_y, source->glow_size);
+		render_source_at(line.text_source, text_x, text_y);
+		y += static_cast<float>(line.text_height) + gap;
 	}
 }
 
@@ -1439,7 +1496,6 @@ enum obs_media_state nowplaylist_media_get_state(void *data)
 obs_properties_t *nowplaylist_properties(void *)
 {
 	obs_properties_t *props = obs_properties_create();
-	obs_properties_set_flags(props, OBS_PROPERTIES_DEFER_UPDATE);
 
 	obs_property_t *playlist = obs_properties_add_editable_list(
 		props, kPlaylistSetting, tr_text("NowPlaylisting.Playlist", "Playlist"), OBS_EDITABLE_LIST_TYPE_FILES,
@@ -1457,8 +1513,8 @@ obs_properties_t *nowplaylist_properties(void *)
 	obs_properties_add_color(props, kOutlineColorSetting, tr_text("NowPlaylisting.OutlineColor", "Outline Color"));
 	obs_properties_add_int_slider(props, kOutlineSizeSetting, tr_text("NowPlaylisting.OutlineSize", "Outline Size"),
 				      0, 20, 1);
-	obs_properties_add_color(props, kGlowColorSetting, tr_text("NowPlaylisting.GlowColor", "Glow Color"));
-	obs_properties_add_int_slider(props, kGlowSizeSetting, tr_text("NowPlaylisting.GlowSize", "Glow Size"), 0, 20,
+	obs_properties_add_color(props, kGlowColorSetting, tr_text("NowPlaylisting.ShadowColor", "Shadow Color"));
+	obs_properties_add_int_slider(props, kGlowSizeSetting, tr_text("NowPlaylisting.ShadowSize", "Shadow Size"), 0, 20,
 				      1);
 	obs_properties_add_int(props, kOffsetXSetting, tr_text("NowPlaylisting.OffsetX", "Text Offset X"), -4096, 4096,
 			       1);

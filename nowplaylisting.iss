@@ -1,0 +1,107 @@
+#define MyAppName "NowPlaylisting"
+#define MyAppVersion "0.9.2"
+#define MyAppPublisher "Vizmatic, LLC"
+#define MyAppURL "https://vizmatic.sorryneedboost.com"
+#define SourceDll "build\\RelWithDebInfo\\nowplaylisting.dll"
+#define SourceLocaleDir "data\\locale"
+#define SetupImageFile "assets\\nowplaylisting_setup_logo.png"
+#define SetupSmallImageFile "assets\\nowplaylisting_logo.png"
+#define IconFile "assets\\nowplaylisting_logo.ico"
+
+#ifnexist SourceDll
+  #error "Build output not found: build\\RelWithDebInfo\\nowplaylisting.dll"
+#endif
+#ifnexist SetupImageFile
+  #error "Wizard image not found: assets\\nowplaylisting_setup_logo.png"
+#endif
+
+[Setup]
+AppId={{2D4749D8-8EA1-48D9-B45E-8691A396B8A0}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppURL}
+AppSupportURL={#MyAppURL}
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+Compression=lzma2
+DefaultDirName={autopf}\obs-studio\obs-plugins\64bit
+DefaultGroupName={#MyAppName}
+DisableProgramGroupPage=yes
+DisableDirPage=yes
+DirExistsWarning=no
+OutputDir=build\installer
+OutputBaseFilename=nowplaylisting-setup-win64-{#MyAppVersion}
+PrivilegesRequired=admin
+SetupIconFile={#IconFile}
+SolidCompression=yes
+UninstallDisplayIcon={app}\nowplaylisting.dll
+WizardImageFile={#SetupImageFile}
+WizardImageFileDynamicDark={#SetupImageFile}
+WizardImageStretch=yes
+WizardImageAlphaFormat=premultiplied
+WizardKeepAspectRatio=yes
+WizardSizePercent=120,120
+WizardSmallImageFile={#SetupSmallImageFile}
+WizardStyle=modern dark windows11
+
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Files]
+Source: "{#SourceDll}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceLocaleDir}\*"; DestDir: "{app}\..\..\data\obs-plugins\nowplaylisting\locale"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\..\..\data\obs-plugins\nowplaylisting\locale"
+
+[Code]
+var
+  PluginsDirPage: TInputDirWizardPage;
+
+function DefaultObsPluginsDir: string;
+begin
+  Result := ExpandConstant('{autopf}\obs-studio\obs-plugins\64bit');
+end;
+
+procedure InitializeWizard;
+begin
+  PluginsDirPage := CreateInputDirPage(
+    wpWelcome,
+    'Select OBS Plugins Folder',
+    'Choose where NowPlaylisting will be installed.',
+    'Select the OBS 64-bit plugins folder. Typical path:' + #13#10 +
+      'C:\Program Files\obs-studio\obs-plugins\64bit',
+    False,
+    ''
+  );
+  PluginsDirPage.Add('OBS plugins folder:');
+  PluginsDirPage.Values[0] := DefaultObsPluginsDir();
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  SelectedDir: string;
+begin
+  Result := True;
+
+  if Assigned(PluginsDirPage) and (CurPageID = PluginsDirPage.ID) then begin
+    SelectedDir := RemoveBackslashUnlessRoot(Trim(PluginsDirPage.Values[0]));
+
+    if SelectedDir = '' then begin
+      MsgBox('Please select the OBS plugins folder path.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+
+    if not DirExists(SelectedDir) then begin
+      MsgBox('The selected path does not exist.' + #13#10#13#10 +
+        'Please choose an existing OBS plugins folder.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+
+    WizardForm.DirEdit.Text := SelectedDir;
+  end;
+end;

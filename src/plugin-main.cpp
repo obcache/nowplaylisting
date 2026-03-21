@@ -2,6 +2,10 @@
 
 #include "nowplaylisting-source.hpp"
 
+#ifndef NOWPLAYLISTING_VERSION
+#define NOWPLAYLISTING_VERSION "unknown"
+#endif
+
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("nowplaylisting", "en-US")
 
@@ -13,7 +17,8 @@ MODULE_EXPORT const char *obs_module_description(void)
 bool obs_module_load(void)
 {
 	register_nowplaylisting_source();
-	blog(LOG_INFO, "[nowplaylisting] module loaded");
+	blog(LOG_INFO, "[nowplaylisting] module loaded (version=%s, build=%s %s)", NOWPLAYLISTING_VERSION,
+	     __DATE__, __TIME__);
 	return true;
 }
 
