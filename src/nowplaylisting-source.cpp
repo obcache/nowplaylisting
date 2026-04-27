@@ -2,14 +2,18 @@
 
 #include <obs-module.h>
 #include <util/platform.h>
+#include <graphics/vec4.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -38,8 +42,38 @@ namespace {
 constexpr const char *kSourceId = "nowplaylisting_source";
 constexpr const char *kPlaylistSetting = "playlist";
 constexpr const char *kRecursiveSetting = "recursive";
+constexpr const char *kPlaylistSelectedSetting = "playlist_selected";
+constexpr const char *kPlaylistArtistEditSetting = "playlist_artist_edit";
+constexpr const char *kPlaylistTitleEditSetting = "playlist_title_edit";
+constexpr const char *kPlaylistShowTagsEditSetting = "playlist_show_tags_edit";
+constexpr const char *kPlaylistSaveRecordButton = "playlist_save_record";
+constexpr const char *kPlaylistMoveUpButton = "playlist_move_up";
+constexpr const char *kPlaylistMoveDownButton = "playlist_move_down";
+constexpr const char *kPlaylistExpandedViewSetting = "playlist_expanded_view";
+constexpr const char *kPlaylistExpandedToggleButton = "playlist_expanded_toggle";
+constexpr const char *kPlaylistPreviewTextSetting = "playlist_preview_text";
+constexpr const char *kSavedPlaylistSelectSetting = "saved_playlist_select";
+constexpr const char *kSavedPlaylistNameSetting = "saved_playlist_name";
+constexpr const char *kSavedPlaylistNewButton = "saved_playlist_new";
+constexpr const char *kSavedPlaylistSaveButton = "saved_playlist_save";
+constexpr const char *kSavedPlaylistRenameButton = "saved_playlist_rename";
+constexpr const char *kSavedPlaylistExportPathSetting = "saved_playlist_export_path";
+constexpr const char *kSavedPlaylistExportButton = "saved_playlist_export";
 constexpr const char *kShuffleSetting = "shuffle";
 constexpr const char *kLoopSetting = "loop";
+constexpr const char *kExportTagsEnabledSetting = "save_current_tags_to_files";
+constexpr const char *kExportArtistPathSetting = "artist_output_file";
+constexpr const char *kExportTitlePathSetting = "title_output_file";
+constexpr const char *kBounceIntensitySetting = "bounce_intensity";
+constexpr const char *kShakeIntensitySetting = "shake_intensity";
+constexpr const char *kMediaBrightnessSetting = "media_brightness";
+constexpr const char *kMediaContrastSetting = "media_contrast";
+constexpr const char *kMediaSaturationSetting = "media_saturation";
+constexpr const char *kMediaGlowColorSetting = "media_glow_color";
+constexpr const char *kMediaGlowSizeSetting = "media_glow_size";
+constexpr const char *kMediaGlowIntensitySetting = "media_glow_intensity";
+constexpr const char *kMediaVignetteStrengthSetting = "media_vignette_strength";
+constexpr const char *kMediaVignetteRoundnessSetting = "media_vignette_roundness";
 constexpr const char *kFontSetting = "font";
 constexpr const char *kTextColorSetting = "text_color";
 constexpr const char *kOutlineColorSetting = "glow_color";
@@ -60,20 +94,122 @@ constexpr int kDefaultOffset = 0;
 constexpr int kDefaultFontSize = 96;
 constexpr int kFontSizeScaleMultiplier = 3;
 constexpr float kDefaultTitleGap = 12.0f;
+constexpr int kDefaultBounceIntensity = 0;
+constexpr int kDefaultShakeIntensity = 0;
+constexpr int kDefaultMediaSaturation = 100;
+constexpr uint32_t kDefaultMediaGlowColor = 0xFFFFFF;
+constexpr int kDefaultMediaVignetteRoundness = 100;
+constexpr size_t kDefaultPlaylistPreviewRows = 8;
+constexpr size_t kExpandedPlaylistPreviewRows = 18;
+constexpr const char *kSavedPlaylistsFile = "saved-playlists.json";
+constexpr const char *kSavedPlaylistsRootKey = "playlists";
+constexpr const char *kSavedPlaylistNameKey = "name";
+constexpr const char *kSavedPlaylistItemsKey = "items";
 constexpr const char *kMediaFileFilter =
 	"Media Files (*.mp3 *.wav *.aiff *.aif *.mp4 *.mpg *.mpeg *.mkv *.avi);;All Files (*.*)";
+constexpr const char *kTextFileFilter = "Text Files (*.txt);;All Files (*.*)";
+constexpr const char *kEmbeddedMediaEffect = R"(
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float brightness;
+uniform float contrast;
+uniform float saturation;
+uniform float2 texel_size;
+uniform float glow_size;
+uniform float glow_intensity;
+uniform float4 glow_color;
+uniform float vignette_strength;
+uniform float vignette_roundness;
+
+sampler_state textureSampler {
+	Filter = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+VertData VSDefault(VertData vert_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = vert_in.uv;
+	return vert_out;
+}
+
+float sample_alpha(float2 uv)
+{
+	return image.Sample(textureSampler, uv).a;
+}
+
+float4 PSNowPlaylistingMedia(VertData vert_in) : TARGET
+{
+	float4 src = image.Sample(textureSampler, vert_in.uv);
+	float alpha = src.a;
+	float3 rgb = (alpha > 0.0001) ? (src.rgb / alpha) : float3(0.0, 0.0, 0.0);
+
+	rgb = (rgb - 0.5.xxx) * (1.0 + contrast) + 0.5.xxx;
+	rgb += brightness.xxx;
+
+	float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+	rgb = lerp(luma.xxx, rgb, max(saturation, 0.0));
+
+	if (glow_intensity > 0.0001 && glow_size > 0.0001) {
+		float2 radius = texel_size * glow_size;
+		float alpha_sum = 0.0;
+		alpha_sum += sample_alpha(vert_in.uv + float2(radius.x, 0.0));
+		alpha_sum += sample_alpha(vert_in.uv + float2(-radius.x, 0.0));
+		alpha_sum += sample_alpha(vert_in.uv + float2(0.0, radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(0.0, -radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(radius.x, radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(radius.x, -radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(-radius.x, radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(-radius.x, -radius.y));
+		float avg_alpha = alpha_sum / 8.0;
+		float edge = saturate(avg_alpha - alpha);
+		rgb += glow_color.rgb * edge * glow_intensity;
+	}
+
+	if (vignette_strength > 0.0001) {
+		float2 p = vert_in.uv * 2.0 - 1.0;
+		float roundness = max(vignette_roundness, 0.01);
+		p.x /= roundness;
+		float distance_from_center = length(p);
+		float vignette_mask = smoothstep(0.35, 1.0, distance_from_center);
+		rgb *= (1.0 - vignette_strength * vignette_mask);
+	}
+
+	rgb = saturate(rgb);
+	return float4(rgb * alpha, alpha);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader = PSNowPlaylistingMedia(vert_in);
+	}
+}
+)";
 
 enum class media_kind { unsupported, audio, video };
 
 struct metadata_info {
 	std::string artist;
 	std::string title;
+	bool show_tags = true;
 };
 
 struct playlist_item {
 	std::string path;
 	std::string artist;
 	std::string title;
+	bool show_tags = true;
 };
 
 struct nowplaylist_source {
@@ -85,6 +221,19 @@ struct nowplaylist_source {
 	obs_source_t *title_glow_source = nullptr;
 	obs_source_t *title_source = nullptr;
 	obs_data_t *font_settings = nullptr;
+	gs_texrender_t *media_texrender = nullptr;
+	gs_effect_t *media_effect = nullptr;
+	gs_eparam_t *media_param_image = nullptr;
+	gs_eparam_t *media_param_brightness = nullptr;
+	gs_eparam_t *media_param_contrast = nullptr;
+	gs_eparam_t *media_param_saturation = nullptr;
+	gs_eparam_t *media_param_texel_size = nullptr;
+	gs_eparam_t *media_param_glow_size = nullptr;
+	gs_eparam_t *media_param_glow_intensity = nullptr;
+	gs_eparam_t *media_param_glow_color = nullptr;
+	gs_eparam_t *media_param_vignette_strength = nullptr;
+	gs_eparam_t *media_param_vignette_roundness = nullptr;
+	bool media_effect_load_attempted = false;
 	uint32_t output_sample_rate = 48000;
 	enum speaker_layout output_speakers = SPEAKERS_STEREO;
 
@@ -106,6 +255,9 @@ struct nowplaylist_source {
 	std::string current_album_art_path;
 	std::string current_artist;
 	std::string current_title;
+	std::string current_artist_for_export;
+	std::string current_title_for_export;
+	bool current_show_tags = true;
 
 	uint32_t text_color = kDefaultTextColor;
 	uint32_t outline_color = kDefaultOutlineColor;
@@ -114,11 +266,28 @@ struct nowplaylist_source {
 	int glow_size = kDefaultGlowSize;
 	int offset_x = kDefaultOffset;
 	int offset_y = kDefaultOffset;
+	bool export_tags_to_files = false;
+	std::string artist_output_file;
+	std::string title_output_file;
+	int bounce_intensity = kDefaultBounceIntensity;
+	int shake_intensity = kDefaultShakeIntensity;
+	std::atomic<float> audio_peak{0.0f};
+	float smoothed_peak = 0.0f;
+	float media_brightness = 0.0f;
+	float media_contrast = 0.0f;
+	float media_saturation = 1.0f;
+	uint32_t media_glow_color = kDefaultMediaGlowColor;
+	float media_glow_size = 0.0f;
+	float media_glow_intensity = 0.0f;
+	float media_vignette_strength = 0.0f;
+	float media_vignette_roundness = 1.0f;
 
 	std::mt19937 rng{std::random_device{}()};
 };
 
 void nowplaylist_update(void *data, obs_data_t *settings);
+std::vector<playlist_item> read_and_normalize_playlist_items(obs_data_t *settings, bool recursive_dirs);
+std::string playlist_item_display_text(const playlist_item &item, size_t index);
 
 class scoped_com_init {
 public:
@@ -234,6 +403,300 @@ std::string normalize_path_key(const std::string &path_utf8)
 
 	std::replace(key.begin(), key.end(), '\\', '/');
 	return lower_ascii(key);
+}
+
+std::string module_text_path(const char *filename)
+{
+	if (!filename || !*filename)
+		return {};
+
+	char *raw = obs_module_config_path(filename);
+	if (!raw)
+		return {};
+
+	std::string out(raw);
+	bfree(raw);
+	return out;
+}
+
+obs_data_t *load_saved_playlists_store()
+{
+	const std::string store_path = module_text_path(kSavedPlaylistsFile);
+	obs_data_t *store = nullptr;
+	if (!store_path.empty())
+		store = obs_data_create_from_json_file(store_path.c_str());
+	if (!store)
+		store = obs_data_create();
+
+	obs_data_array_t *playlists = obs_data_get_array(store, kSavedPlaylistsRootKey);
+	if (!playlists) {
+		playlists = obs_data_array_create();
+		obs_data_set_array(store, kSavedPlaylistsRootKey, playlists);
+	}
+	obs_data_array_release(playlists);
+	return store;
+}
+
+bool save_saved_playlists_store(obs_data_t *store)
+{
+	if (!store)
+		return false;
+
+	const std::string store_path = module_text_path(kSavedPlaylistsFile);
+	if (store_path.empty())
+		return false;
+
+	const fs::path output_path = utf8_to_path(store_path);
+	std::error_code ec;
+	const fs::path parent = output_path.parent_path();
+	if (!parent.empty())
+		fs::create_directories(parent, ec);
+
+	return obs_data_save_json_pretty_safe(store, store_path.c_str(), "tmp", "bak");
+}
+
+int64_t find_saved_playlist_index(obs_data_array_t *playlists, const std::string &name)
+{
+	if (!playlists || name.empty())
+		return -1;
+
+	const size_t count = obs_data_array_count(playlists);
+	for (size_t i = 0; i < count; ++i) {
+		obs_data_t *entry = obs_data_array_item(playlists, i);
+		if (!entry)
+			continue;
+
+		const char *stored_name_raw = obs_data_get_string(entry, kSavedPlaylistNameKey);
+		const std::string stored_name = stored_name_raw ? trim(stored_name_raw) : std::string();
+		obs_data_release(entry);
+		if (stored_name == name)
+			return static_cast<int64_t>(i);
+	}
+
+	return -1;
+}
+
+std::vector<std::string> read_saved_playlist_names(obs_data_t *store)
+{
+	std::vector<std::string> names;
+	if (!store)
+		return names;
+
+	obs_data_array_t *playlists = obs_data_get_array(store, kSavedPlaylistsRootKey);
+	if (!playlists)
+		return names;
+
+	const size_t count = obs_data_array_count(playlists);
+	names.reserve(count);
+	for (size_t i = 0; i < count; ++i) {
+		obs_data_t *entry = obs_data_array_item(playlists, i);
+		if (!entry)
+			continue;
+
+		const char *name_raw = obs_data_get_string(entry, kSavedPlaylistNameKey);
+		const std::string name = name_raw ? trim(name_raw) : std::string();
+		if (!name.empty())
+			names.emplace_back(name);
+		obs_data_release(entry);
+	}
+
+	obs_data_array_release(playlists);
+	return names;
+}
+
+std::string make_unique_saved_playlist_name(obs_data_t *store, const std::string &desired_name)
+{
+	std::string base_name = trim(desired_name);
+	if (base_name.empty())
+		base_name = "Playlist";
+
+	obs_data_array_t *playlists = obs_data_get_array(store, kSavedPlaylistsRootKey);
+	if (!playlists)
+		return base_name;
+
+	if (find_saved_playlist_index(playlists, base_name) < 0) {
+		obs_data_array_release(playlists);
+		return base_name;
+	}
+
+	for (int suffix = 2; suffix < 10000; ++suffix) {
+		const std::string candidate = base_name + " (" + std::to_string(suffix) + ")";
+		if (find_saved_playlist_index(playlists, candidate) < 0) {
+			obs_data_array_release(playlists);
+			return candidate;
+		}
+	}
+
+	obs_data_array_release(playlists);
+	return base_name;
+}
+
+bool write_current_playlist_to_store(obs_data_t *store, const std::string &name, obs_data_array_t *items,
+				     bool create_if_missing)
+{
+	if (!store || name.empty())
+		return false;
+
+	obs_data_array_t *playlists = obs_data_get_array(store, kSavedPlaylistsRootKey);
+	if (!playlists)
+		return false;
+
+	int64_t index = find_saved_playlist_index(playlists, name);
+	if (index < 0) {
+		if (!create_if_missing) {
+			obs_data_array_release(playlists);
+			return false;
+		}
+
+		obs_data_t *entry = obs_data_create();
+		obs_data_set_string(entry, kSavedPlaylistNameKey, name.c_str());
+		if (items)
+			obs_data_set_array(entry, kSavedPlaylistItemsKey, items);
+		else {
+			obs_data_array_t *empty_items = obs_data_array_create();
+			obs_data_set_array(entry, kSavedPlaylistItemsKey, empty_items);
+			obs_data_array_release(empty_items);
+		}
+		obs_data_array_push_back(playlists, entry);
+		obs_data_release(entry);
+	} else {
+		obs_data_t *entry = obs_data_array_item(playlists, static_cast<size_t>(index));
+		if (entry) {
+			obs_data_set_string(entry, kSavedPlaylistNameKey, name.c_str());
+			if (items)
+				obs_data_set_array(entry, kSavedPlaylistItemsKey, items);
+			else {
+				obs_data_array_t *empty_items = obs_data_array_create();
+				obs_data_set_array(entry, kSavedPlaylistItemsKey, empty_items);
+				obs_data_array_release(empty_items);
+			}
+			obs_data_release(entry);
+		}
+	}
+
+	obs_data_set_array(store, kSavedPlaylistsRootKey, playlists);
+	obs_data_array_release(playlists);
+	return true;
+}
+
+bool load_saved_playlist_into_settings(obs_data_t *settings, const std::string &name)
+{
+	if (!settings || name.empty())
+		return false;
+
+	obs_data_t *store = load_saved_playlists_store();
+	if (!store)
+		return false;
+
+	obs_data_array_t *playlists = obs_data_get_array(store, kSavedPlaylistsRootKey);
+	if (!playlists) {
+		obs_data_release(store);
+		return false;
+	}
+
+	bool loaded = false;
+	const int64_t index = find_saved_playlist_index(playlists, name);
+	if (index >= 0) {
+		obs_data_t *entry = obs_data_array_item(playlists, static_cast<size_t>(index));
+		if (entry) {
+			obs_data_array_t *items = obs_data_get_array(entry, kSavedPlaylistItemsKey);
+			if (items) {
+				obs_data_set_array(settings, kPlaylistSetting, items);
+				obs_data_array_release(items);
+				loaded = true;
+			}
+			obs_data_release(entry);
+		}
+	}
+
+	obs_data_array_release(playlists);
+	obs_data_release(store);
+	return loaded;
+}
+
+bool rename_saved_playlist(obs_data_t *store, const std::string &old_name, const std::string &new_name)
+{
+	if (!store || old_name.empty() || new_name.empty() || old_name == new_name)
+		return false;
+
+	obs_data_array_t *playlists = obs_data_get_array(store, kSavedPlaylistsRootKey);
+	if (!playlists)
+		return false;
+
+	const int64_t old_index = find_saved_playlist_index(playlists, old_name);
+	if (old_index < 0 || find_saved_playlist_index(playlists, new_name) >= 0) {
+		obs_data_array_release(playlists);
+		return false;
+	}
+
+	obs_data_t *entry = obs_data_array_item(playlists, static_cast<size_t>(old_index));
+	if (!entry) {
+		obs_data_array_release(playlists);
+		return false;
+	}
+
+	obs_data_set_string(entry, kSavedPlaylistNameKey, new_name.c_str());
+	obs_data_release(entry);
+
+	obs_data_set_array(store, kSavedPlaylistsRootKey, playlists);
+	obs_data_array_release(playlists);
+	return true;
+}
+
+std::string build_playlist_preview_text(obs_data_t *settings)
+{
+	if (!settings)
+		return {};
+
+	const bool recursive_dirs = obs_data_get_bool(settings, kRecursiveSetting);
+	const std::vector<playlist_item> items = read_and_normalize_playlist_items(settings, recursive_dirs);
+	if (items.empty())
+		return "(playlist is empty)";
+
+	const bool expanded = obs_data_get_bool(settings, kPlaylistExpandedViewSetting);
+	const size_t row_limit = expanded ? kExpandedPlaylistPreviewRows : kDefaultPlaylistPreviewRows;
+	const size_t render_count = std::min(row_limit, items.size());
+
+	std::string text;
+	for (size_t i = 0; i < render_count; ++i) {
+		text += playlist_item_display_text(items[i], i);
+		text += '\n';
+	}
+
+	if (items.size() > render_count) {
+		text += "... +" + std::to_string(items.size() - render_count) + " more";
+	}
+
+	return text;
+}
+
+void write_utf8_text_file(const std::string &path_utf8, const std::string &text_utf8)
+{
+	if (path_utf8.empty())
+		return;
+
+	const fs::path output_path = utf8_to_path(path_utf8);
+	std::error_code ec;
+	const fs::path parent = output_path.parent_path();
+	if (!parent.empty())
+		fs::create_directories(parent, ec);
+
+	std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
+	if (!out.is_open()) {
+		blog(LOG_WARNING, "[nowplaylisting] failed to open text output file: '%s'", path_utf8.c_str());
+		return;
+	}
+
+	out.write(text_utf8.data(), static_cast<std::streamsize>(text_utf8.size()));
+}
+
+bool read_show_tags_flag(obs_data_t *item)
+{
+	if (!item)
+		return true;
+	if (!obs_data_has_user_value(item, "show_tags"))
+		return true;
+	return obs_data_get_bool(item, "show_tags");
 }
 
 media_kind classify_media_file(const fs::path &path)
@@ -476,6 +939,8 @@ std::vector<playlist_item> read_and_normalize_playlist_items(obs_data_t *setting
 		const std::string path = value_raw ? trim(value_raw) : std::string();
 		const char *artist_raw = obs_data_get_string(item, "artist");
 		const char *title_raw = obs_data_get_string(item, "title");
+		const bool has_show_tags = obs_data_has_user_value(item, "show_tags");
+		const bool show_tags = read_show_tags_flag(item);
 		const std::string existing_artist = artist_raw ? trim(artist_raw) : std::string();
 		const std::string existing_title = title_raw ? trim(title_raw) : std::string();
 
@@ -492,7 +957,7 @@ std::vector<playlist_item> read_and_normalize_playlist_items(obs_data_t *setting
 		std::error_code ec;
 
 		auto append_normalized_item = [&](const fs::path &media_path, const std::string &seed_artist,
-						  const std::string &seed_title) {
+						  const std::string &seed_title, const bool seed_show_tags) {
 			std::string out_path = path_to_utf8(media_path);
 			const std::string out_key = normalize_path_key(out_path);
 			if (!seen_paths.insert(out_key).second)
@@ -516,12 +981,14 @@ std::vector<playlist_item> read_and_normalize_playlist_items(obs_data_t *setting
 			normalized_item.path = out_path;
 			normalized_item.artist = out_artist;
 			normalized_item.title = out_title;
+			normalized_item.show_tags = seed_show_tags;
 			items.emplace_back(normalized_item);
 
 			obs_data_t *normalized_data = obs_data_create();
 			obs_data_set_string(normalized_data, "value", normalized_item.path.c_str());
 			obs_data_set_string(normalized_data, "artist", normalized_item.artist.c_str());
 			obs_data_set_string(normalized_data, "title", normalized_item.title.c_str());
+			obs_data_set_bool(normalized_data, "show_tags", normalized_item.show_tags);
 			obs_data_array_push_back(normalized, normalized_data);
 			obs_data_release(normalized_data);
 		};
@@ -533,9 +1000,9 @@ std::vector<playlist_item> read_and_normalize_playlist_items(obs_data_t *setting
 				continue;
 			}
 
-			append_normalized_item(entry_path, artist, title);
+			append_normalized_item(entry_path, artist, title, show_tags);
 			if (path != (value_raw ? std::string(value_raw) : std::string()) || artist != existing_artist ||
-			    title != existing_title) {
+			    title != existing_title || !has_show_tags) {
 				changed = true;
 			}
 			obs_data_release(item);
@@ -547,7 +1014,7 @@ std::vector<playlist_item> read_and_normalize_playlist_items(obs_data_t *setting
 			std::vector<std::string> expanded_paths;
 			append_directory_files(entry_path, recursive_dirs, expanded_paths);
 			for (const std::string &expanded_path : expanded_paths)
-				append_normalized_item(utf8_to_path(expanded_path), std::string(), std::string());
+				append_normalized_item(utf8_to_path(expanded_path), std::string(), std::string(), true);
 
 			changed = true;
 			obs_data_release(item);
@@ -584,8 +1051,333 @@ void rebuild_playlist_runtime_cache(nowplaylist_source *source)
 		metadata_info metadata{};
 		metadata.artist = item.artist;
 		metadata.title = item.title;
+		metadata.show_tags = item.show_tags;
 		source->metadata_by_path[normalize_path_key(item.path)] = metadata;
 	}
+}
+
+std::string playlist_item_display_text(const playlist_item &item, size_t index)
+{
+	std::string filename = path_to_utf8(utf8_to_path(item.path).filename());
+	if (filename.empty())
+		filename = item.path;
+
+	const std::string artist = item.artist.empty() ? "-" : item.artist;
+	const std::string title = item.title.empty() ? "-" : item.title;
+	const char *tag_state = item.show_tags ? "On" : "Off";
+
+	char index_buf[32];
+	snprintf(index_buf, sizeof(index_buf), "%zu", index + 1);
+
+	return std::string(index_buf) + ". " + filename + " | Artist: " + artist + " | Title: " + title +
+	       " | Tags: " + tag_state;
+}
+
+void set_playlist_editor_defaults(obs_data_t *settings)
+{
+	if (!settings)
+		return;
+
+	obs_data_set_int(settings, kPlaylistSelectedSetting, -1);
+	obs_data_set_string(settings, kPlaylistArtistEditSetting, "");
+	obs_data_set_string(settings, kPlaylistTitleEditSetting, "");
+	obs_data_set_bool(settings, kPlaylistShowTagsEditSetting, true);
+}
+
+int64_t clamp_playlist_selected_index(obs_data_t *settings, size_t count)
+{
+	if (!settings || count == 0) {
+		set_playlist_editor_defaults(settings);
+		return -1;
+	}
+
+	int64_t selected = obs_data_get_int(settings, kPlaylistSelectedSetting);
+	if (selected < 0)
+		selected = 0;
+	if (selected >= static_cast<int64_t>(count))
+		selected = static_cast<int64_t>(count - 1);
+
+	obs_data_set_int(settings, kPlaylistSelectedSetting, selected);
+	return selected;
+}
+
+bool get_playlist_item_at(obs_data_t *settings, size_t index, playlist_item *out_item)
+{
+	if (!settings || !out_item)
+		return false;
+
+	obs_data_array_t *playlist = obs_data_get_array(settings, kPlaylistSetting);
+	if (!playlist)
+		return false;
+
+	bool found = false;
+	const size_t count = obs_data_array_count(playlist);
+	if (index < count) {
+		obs_data_t *item = obs_data_array_item(playlist, index);
+		if (item) {
+			const char *value_raw = obs_data_get_string(item, "value");
+			const char *artist_raw = obs_data_get_string(item, "artist");
+			const char *title_raw = obs_data_get_string(item, "title");
+			out_item->path = value_raw ? trim(value_raw) : std::string();
+			out_item->artist = artist_raw ? trim(artist_raw) : std::string();
+			out_item->title = title_raw ? trim(title_raw) : std::string();
+			out_item->show_tags = read_show_tags_flag(item);
+			obs_data_release(item);
+			found = true;
+		}
+	}
+
+	obs_data_array_release(playlist);
+	return found;
+}
+
+void sync_editor_from_selected_item(obs_data_t *settings)
+{
+	if (!settings)
+		return;
+
+	obs_data_array_t *playlist = obs_data_get_array(settings, kPlaylistSetting);
+	if (!playlist) {
+		set_playlist_editor_defaults(settings);
+		return;
+	}
+
+	const size_t count = obs_data_array_count(playlist);
+	obs_data_array_release(playlist);
+
+	const int64_t selected = clamp_playlist_selected_index(settings, count);
+	if (selected < 0)
+		return;
+
+	playlist_item selected_item{};
+	if (!get_playlist_item_at(settings, static_cast<size_t>(selected), &selected_item))
+		return;
+
+	obs_data_set_string(settings, kPlaylistArtistEditSetting, selected_item.artist.c_str());
+	obs_data_set_string(settings, kPlaylistTitleEditSetting, selected_item.title.c_str());
+	obs_data_set_bool(settings, kPlaylistShowTagsEditSetting, selected_item.show_tags);
+}
+
+void sync_playlist_preview_text(obs_data_t *settings)
+{
+	if (!settings)
+		return;
+
+	const std::string preview = build_playlist_preview_text(settings);
+	obs_data_set_string(settings, kPlaylistPreviewTextSetting, preview.c_str());
+}
+
+void rebuild_saved_playlists_property(obs_properties_t *props, obs_data_t *settings)
+{
+	if (!props || !settings)
+		return;
+
+	obs_property_t *saved_playlist_prop = obs_properties_get(props, kSavedPlaylistSelectSetting);
+	if (!saved_playlist_prop)
+		return;
+
+	obs_data_t *store = load_saved_playlists_store();
+	std::vector<std::string> names = read_saved_playlist_names(store);
+	obs_data_release(store);
+
+	obs_property_list_clear(saved_playlist_prop);
+	obs_property_list_add_string(saved_playlist_prop, "(none)", "");
+	for (const std::string &name : names)
+		obs_property_list_add_string(saved_playlist_prop, name.c_str(), name.c_str());
+
+	const char *selected_raw = obs_data_get_string(settings, kSavedPlaylistSelectSetting);
+	std::string selected = selected_raw ? trim(selected_raw) : std::string();
+	if (!selected.empty()) {
+		const bool exists = std::find(names.begin(), names.end(), selected) != names.end();
+		if (!exists)
+			selected.clear();
+	}
+
+	obs_data_set_string(settings, kSavedPlaylistSelectSetting, selected.c_str());
+	if (!selected.empty())
+		obs_data_set_string(settings, kSavedPlaylistNameSetting, selected.c_str());
+}
+
+void rebuild_playlist_selector_property(obs_properties_t *props, obs_data_t *settings)
+{
+	if (!props || !settings)
+		return;
+
+	obs_property_t *selector = obs_properties_get(props, kPlaylistSelectedSetting);
+	if (!selector)
+		return;
+
+	const bool recursive_dirs = obs_data_get_bool(settings, kRecursiveSetting);
+	const std::vector<playlist_item> items = read_and_normalize_playlist_items(settings, recursive_dirs);
+
+	obs_property_list_clear(selector);
+	for (size_t i = 0; i < items.size(); ++i) {
+		const std::string label = playlist_item_display_text(items[i], i);
+		obs_property_list_add_int(selector, label.c_str(), static_cast<long long>(i));
+	}
+
+	if (items.empty()) {
+		set_playlist_editor_defaults(settings);
+		sync_playlist_preview_text(settings);
+		return;
+	}
+
+	clamp_playlist_selected_index(settings, items.size());
+	sync_editor_from_selected_item(settings);
+	sync_playlist_preview_text(settings);
+}
+
+bool update_selected_playlist_item_metadata(obs_data_t *settings)
+{
+	if (!settings)
+		return false;
+
+	obs_data_array_t *playlist = obs_data_get_array(settings, kPlaylistSetting);
+	if (!playlist)
+		return false;
+
+	const size_t count = obs_data_array_count(playlist);
+	const int64_t selected = clamp_playlist_selected_index(settings, count);
+	if (selected < 0 || selected >= static_cast<int64_t>(count)) {
+		obs_data_array_release(playlist);
+		return false;
+	}
+
+	obs_data_t *item = obs_data_array_item(playlist, static_cast<size_t>(selected));
+	if (!item) {
+		obs_data_array_release(playlist);
+		return false;
+	}
+
+	const char *artist_raw = obs_data_get_string(settings, kPlaylistArtistEditSetting);
+	const char *title_raw = obs_data_get_string(settings, kPlaylistTitleEditSetting);
+	const std::string artist = artist_raw ? trim(artist_raw) : std::string();
+	const std::string title = title_raw ? trim(title_raw) : std::string();
+	const bool show_tags = obs_data_get_bool(settings, kPlaylistShowTagsEditSetting);
+
+	obs_data_set_string(item, "artist", artist.c_str());
+	obs_data_set_string(item, "title", title.c_str());
+	obs_data_set_bool(item, "show_tags", show_tags);
+	obs_data_release(item);
+
+	obs_data_set_array(settings, kPlaylistSetting, playlist);
+	obs_data_array_release(playlist);
+	return true;
+}
+
+bool move_selected_playlist_item(obs_data_t *settings, int direction, int64_t *out_selected)
+{
+	if (!settings)
+		return false;
+
+	obs_data_array_t *playlist = obs_data_get_array(settings, kPlaylistSetting);
+	if (!playlist)
+		return false;
+
+	const size_t count = obs_data_array_count(playlist);
+	const int64_t selected = clamp_playlist_selected_index(settings, count);
+	if (selected < 0 || selected >= static_cast<int64_t>(count)) {
+		obs_data_array_release(playlist);
+		return false;
+	}
+
+	const int64_t destination = selected + static_cast<int64_t>(direction);
+	if (destination < 0 || destination >= static_cast<int64_t>(count)) {
+		obs_data_array_release(playlist);
+		return false;
+	}
+
+	obs_data_t *item = obs_data_array_item(playlist, static_cast<size_t>(selected));
+	if (!item) {
+		obs_data_array_release(playlist);
+		return false;
+	}
+
+	obs_data_array_erase(playlist, static_cast<size_t>(selected));
+	obs_data_array_insert(playlist, static_cast<size_t>(destination), item);
+	obs_data_release(item);
+
+	obs_data_set_array(settings, kPlaylistSetting, playlist);
+	obs_data_array_release(playlist);
+
+	obs_data_set_int(settings, kPlaylistSelectedSetting, destination);
+	sync_editor_from_selected_item(settings);
+	if (out_selected)
+		*out_selected = destination;
+	return true;
+}
+
+void sync_current_tag_output_files(nowplaylist_source *source)
+{
+	if (!source || !source->export_tags_to_files)
+		return;
+
+	write_utf8_text_file(source->artist_output_file, source->current_artist_for_export);
+	write_utf8_text_file(source->title_output_file, source->current_title_for_export);
+}
+
+float normalize_slider(int value, int min_value, int max_value)
+{
+	if (max_value <= min_value)
+		return 0.0f;
+
+	const int clamped = std::clamp(value, min_value, max_value);
+	return static_cast<float>(clamped - min_value) / static_cast<float>(max_value - min_value);
+}
+
+float normalize_signed_slider(int value, int magnitude)
+{
+	if (magnitude <= 0)
+		return 0.0f;
+	const int clamped = std::clamp(value, -magnitude, magnitude);
+	return static_cast<float>(clamped) / static_cast<float>(magnitude);
+}
+
+float map_media_brightness(int slider_value)
+{
+	const float normalized = normalize_signed_slider(slider_value, 100);
+	return normalized * 0.45f;
+}
+
+float map_media_contrast(int slider_value)
+{
+	const float normalized = normalize_signed_slider(slider_value, 100);
+	const float magnitude = std::pow(std::fabs(normalized), 1.35f);
+	return std::copysign(magnitude * 0.85f, normalized);
+}
+
+float map_media_saturation(int slider_value)
+{
+	const int clamped = std::clamp(slider_value, 0, 300);
+	if (clamped <= 100)
+		return static_cast<float>(clamped) / 100.0f;
+
+	const float t = static_cast<float>(clamped - 100) / 200.0f;
+	return 1.0f + std::pow(t, 1.2f) * 1.2f;
+}
+
+float map_media_glow_size(int slider_value)
+{
+	const float normalized = normalize_slider(slider_value, 0, 48);
+	return std::pow(normalized, 1.6f) * 28.0f;
+}
+
+float map_media_glow_intensity(int slider_value)
+{
+	const float normalized = normalize_slider(slider_value, 0, 200);
+	return std::pow(normalized, 1.35f) * 1.6f;
+}
+
+float map_media_vignette_strength(int slider_value)
+{
+	const float normalized = normalize_slider(slider_value, 0, 100);
+	return std::pow(normalized, 1.5f) * 0.95f;
+}
+
+float map_media_vignette_roundness(int slider_value)
+{
+	const float normalized = normalize_slider(slider_value, 25, 200);
+	return 0.65f + normalized * 1.55f;
 }
 
 void append_directory_files(const fs::path &directory, bool recursive, std::vector<std::string> &out)
@@ -762,9 +1554,9 @@ void update_glow_source_style(obs_source_t *text_source, const std::string &text
 		obs_data_release(scaled_font);
 	}
 	obs_data_set_int(settings, "color", source->glow_color);
-	obs_data_set_int(settings, "opacity", kDefaultGlowOpacity);
+	obs_data_set_int(settings, "opacity", 100);
 	obs_data_set_bool(settings, "outline", true);
-	obs_data_set_int(settings, "outline_size", std::max(source->outline_size, 0));
+	obs_data_set_int(settings, "outline_size", std::max(source->glow_size, 1));
 	obs_data_set_int(settings, "outline_color", source->glow_color);
 	obs_data_set_int(settings, "outline_opacity", 100);
 	obs_data_set_string(settings, "align", "center");
@@ -799,9 +1591,13 @@ void clear_visual_state(nowplaylist_source *source)
 	source->current_is_video = false;
 	source->current_artist.clear();
 	source->current_title.clear();
+	source->current_artist_for_export.clear();
+	source->current_title_for_export.clear();
 	source->current_album_art_path.clear();
+	source->current_show_tags = true;
 	update_text_sources(source);
 	update_album_art_source(source);
+	sync_current_tag_output_files(source);
 }
 
 void apply_track_visual_state(nowplaylist_source *source, const std::string &path_utf8)
@@ -814,9 +1610,13 @@ void apply_track_visual_state(nowplaylist_source *source, const std::string &pat
 	if (source->current_is_video) {
 		source->current_artist.clear();
 		source->current_title.clear();
+		source->current_artist_for_export.clear();
+		source->current_title_for_export.clear();
 		source->current_album_art_path.clear();
+		source->current_show_tags = true;
 		update_text_sources(source);
 		update_album_art_source(source);
+		sync_current_tag_output_files(source);
 		return;
 	}
 
@@ -848,12 +1648,16 @@ void apply_track_visual_state(nowplaylist_source *source, const std::string &pat
 	if (metadata.title.empty())
 		metadata.title = path_to_utf8(media_path.stem());
 
-	source->current_artist = metadata.artist;
-	source->current_title = metadata.title;
+	source->current_show_tags = metadata.show_tags;
+	source->current_artist_for_export = metadata.artist;
+	source->current_title_for_export = metadata.title;
+	source->current_artist = metadata.show_tags ? metadata.artist : std::string();
+	source->current_title = metadata.show_tags ? metadata.title : std::string();
 	source->current_album_art_path = album_art;
 	source->metadata_by_path[metadata_key] = metadata;
 	update_text_sources(source);
 	update_album_art_source(source);
+	sync_current_tag_output_files(source);
 }
 
 std::optional<std::string> current_track_path(const nowplaylist_source *source)
@@ -999,6 +1803,212 @@ void render_diffuse_glow(obs_source_t *glow_source, float x, float y, int glow_s
 	render_source_at(glow_source, x, y);
 }
 
+struct motion_state {
+	float scale = 1.0f;
+	float shake_x = 0.0f;
+	float shake_y = 0.0f;
+};
+
+motion_state compute_audio_motion(nowplaylist_source *source)
+{
+	motion_state motion{};
+	if (!source)
+		return motion;
+
+	const float peak = std::clamp(source->audio_peak.load(std::memory_order_relaxed), 0.0f, 1.5f);
+	source->smoothed_peak = source->smoothed_peak * 0.85f + peak * 0.15f;
+	const float transient = std::max(0.0f, peak - source->smoothed_peak);
+
+	if (source->bounce_intensity > 0) {
+		const float intensity = static_cast<float>(source->bounce_intensity) / 100.0f;
+		motion.scale += transient * intensity * 0.32f;
+	}
+
+	if (source->shake_intensity > 0) {
+		const float intensity = static_cast<float>(source->shake_intensity) / 100.0f;
+		const float shake_pixels = std::clamp(peak, 0.0f, 1.0f) * intensity * 18.0f;
+		if (shake_pixels > 0.01f) {
+			std::uniform_real_distribution<float> random_offset(-1.0f, 1.0f);
+			motion.shake_x = random_offset(source->rng) * shake_pixels;
+			motion.shake_y = random_offset(source->rng) * shake_pixels;
+		}
+	}
+
+	return motion;
+}
+
+void render_media_block(nowplaylist_source *source, uint32_t target_width, uint32_t target_height)
+{
+	if (!source)
+		return;
+
+	if (source->current_is_video) {
+		render_source_fit_centered(source->media_source, target_width, target_height);
+		return;
+	}
+
+	bool drew_background = false;
+	if (source->album_art_source && obs_source_enabled(source->album_art_source)) {
+		render_source_fit_centered(source->album_art_source, target_width, target_height);
+		drew_background = true;
+	}
+
+	if (!drew_background)
+		render_source_fit_centered(source->media_source, target_width, target_height);
+}
+
+void ensure_media_render_resources(nowplaylist_source *source)
+{
+	if (!source)
+		return;
+
+	if (!source->media_texrender)
+		source->media_texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+
+	if (source->media_effect_load_attempted)
+		return;
+
+	source->media_effect_load_attempted = true;
+	char *effect_path = obs_module_file("effects/nowplaylisting_media.effect");
+	if (!effect_path) {
+		blog(LOG_WARNING, "[nowplaylisting] media effect path unavailable");
+		return;
+	}
+
+	char *error_string = nullptr;
+	source->media_effect = gs_effect_create_from_file(effect_path, &error_string);
+	if (!source->media_effect) {
+		blog(LOG_WARNING, "[nowplaylisting] failed to load media effect '%s'%s%s", effect_path,
+		     error_string ? ": " : "", error_string ? error_string : "");
+		if (error_string) {
+			bfree(error_string);
+			error_string = nullptr;
+		}
+
+		source->media_effect =
+			gs_effect_create(kEmbeddedMediaEffect, "nowplaylisting_media_embedded.effect", &error_string);
+		if (!source->media_effect) {
+			blog(LOG_WARNING, "[nowplaylisting] failed to load embedded media effect%s%s",
+			     error_string ? ": " : "", error_string ? error_string : "");
+		}
+	} else {
+		source->media_param_image = gs_effect_get_param_by_name(source->media_effect, "image");
+		source->media_param_brightness = gs_effect_get_param_by_name(source->media_effect, "brightness");
+		source->media_param_contrast = gs_effect_get_param_by_name(source->media_effect, "contrast");
+		source->media_param_saturation = gs_effect_get_param_by_name(source->media_effect, "saturation");
+		source->media_param_texel_size = gs_effect_get_param_by_name(source->media_effect, "texel_size");
+		source->media_param_glow_size = gs_effect_get_param_by_name(source->media_effect, "glow_size");
+		source->media_param_glow_intensity = gs_effect_get_param_by_name(source->media_effect, "glow_intensity");
+		source->media_param_glow_color = gs_effect_get_param_by_name(source->media_effect, "glow_color");
+		source->media_param_vignette_strength =
+			gs_effect_get_param_by_name(source->media_effect, "vignette_strength");
+		source->media_param_vignette_roundness =
+			gs_effect_get_param_by_name(source->media_effect, "vignette_roundness");
+	}
+
+	if (source->media_effect && !source->media_param_image) {
+		source->media_param_image = gs_effect_get_param_by_name(source->media_effect, "image");
+		source->media_param_brightness = gs_effect_get_param_by_name(source->media_effect, "brightness");
+		source->media_param_contrast = gs_effect_get_param_by_name(source->media_effect, "contrast");
+		source->media_param_saturation = gs_effect_get_param_by_name(source->media_effect, "saturation");
+		source->media_param_texel_size = gs_effect_get_param_by_name(source->media_effect, "texel_size");
+		source->media_param_glow_size = gs_effect_get_param_by_name(source->media_effect, "glow_size");
+		source->media_param_glow_intensity = gs_effect_get_param_by_name(source->media_effect, "glow_intensity");
+		source->media_param_glow_color = gs_effect_get_param_by_name(source->media_effect, "glow_color");
+		source->media_param_vignette_strength =
+			gs_effect_get_param_by_name(source->media_effect, "vignette_strength");
+		source->media_param_vignette_roundness =
+			gs_effect_get_param_by_name(source->media_effect, "vignette_roundness");
+	}
+
+	if (error_string)
+		bfree(error_string);
+	bfree(effect_path);
+}
+
+vec4 media_glow_vec4(uint32_t obs_color)
+{
+	const float r = static_cast<float>(obs_color & 0xFF) / 255.0f;
+	const float g = static_cast<float>((obs_color >> 8) & 0xFF) / 255.0f;
+	const float b = static_cast<float>((obs_color >> 16) & 0xFF) / 255.0f;
+	return vec4{r, g, b, 1.0f};
+}
+
+bool render_media_to_texture(nowplaylist_source *source, uint32_t target_width, uint32_t target_height,
+			     const motion_state &motion)
+{
+	if (!source || !source->media_texrender || !target_width || !target_height)
+		return false;
+
+	gs_texrender_reset(source->media_texrender);
+	if (!gs_texrender_begin(source->media_texrender, target_width, target_height))
+		return false;
+
+	vec4 clear;
+	vec4_zero(&clear);
+	gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+	gs_ortho(0.0f, static_cast<float>(target_width), 0.0f, static_cast<float>(target_height), -100.0f, 100.0f);
+
+	const bool apply_motion = (motion.scale > 1.001f || std::fabs(motion.shake_x) > 0.01f ||
+				   std::fabs(motion.shake_y) > 0.01f);
+	if (apply_motion) {
+		const float center_x = static_cast<float>(target_width) * 0.5f;
+		const float center_y = static_cast<float>(target_height) * 0.5f;
+		gs_matrix_push();
+		gs_matrix_translate3f(center_x + motion.shake_x, center_y + motion.shake_y, 0.0f);
+		gs_matrix_scale3f(motion.scale, motion.scale, 1.0f);
+		gs_matrix_translate3f(-center_x, -center_y, 0.0f);
+		render_media_block(source, target_width, target_height);
+		gs_matrix_pop();
+	} else {
+		render_media_block(source, target_width, target_height);
+	}
+
+	gs_texrender_end(source->media_texrender);
+	return true;
+}
+
+void render_media_texture_with_effect(nowplaylist_source *source, uint32_t target_width, uint32_t target_height)
+{
+	if (!source || !source->media_texrender)
+		return;
+
+	gs_texture_t *texture = gs_texrender_get_texture(source->media_texrender);
+	if (!texture)
+		return;
+
+	if (!source->media_effect || !source->media_param_image) {
+		gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+		gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
+		if (!effect || !image)
+			return;
+		gs_effect_set_texture_srgb(image, texture);
+		while (gs_effect_loop(effect, "Draw"))
+			gs_draw_sprite(texture, 0, target_width, target_height);
+		return;
+	}
+
+	const vec4 glow_color = media_glow_vec4(source->media_glow_color);
+	const vec2 texel_size = vec2{1.0f / static_cast<float>(std::max<uint32_t>(target_width, 1)),
+				     1.0f / static_cast<float>(std::max<uint32_t>(target_height, 1))};
+	gs_effect_set_texture_srgb(source->media_param_image, texture);
+	gs_effect_set_float(source->media_param_brightness, source->media_brightness);
+	gs_effect_set_float(source->media_param_contrast, source->media_contrast);
+	gs_effect_set_float(source->media_param_saturation, source->media_saturation);
+	gs_effect_set_vec2(source->media_param_texel_size, &texel_size);
+	gs_effect_set_float(source->media_param_glow_size, source->media_glow_size);
+	gs_effect_set_float(source->media_param_glow_intensity, source->media_glow_intensity);
+	gs_effect_set_vec4(source->media_param_glow_color, &glow_color);
+	gs_effect_set_float(source->media_param_vignette_strength, source->media_vignette_strength);
+	gs_effect_set_float(source->media_param_vignette_roundness, source->media_vignette_roundness);
+
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+	while (gs_effect_loop(source->media_effect, "Draw"))
+		gs_draw_sprite(texture, 0, target_width, target_height);
+	gs_blend_state_pop();
+}
+
 void render_centered_text(nowplaylist_source *source, uint32_t target_width, uint32_t target_height)
 {
 	struct line_info {
@@ -1108,6 +2118,270 @@ void sync_playlist_and_state(nowplaylist_source *source)
 	}
 
 	apply_track_visual_state(source, source->current_media_path);
+}
+
+bool on_playlist_property_modified(void *, obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+	rebuild_playlist_selector_property(props, settings);
+	rebuild_saved_playlists_property(props, settings);
+	return true;
+}
+
+bool on_playlist_selected_modified(void *, obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+	sync_editor_from_selected_item(settings);
+	sync_playlist_preview_text(settings);
+	return true;
+}
+
+bool on_saved_playlist_selected_modified(void *, obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+
+	const char *selected_raw = obs_data_get_string(settings, kSavedPlaylistSelectSetting);
+	const std::string selected = selected_raw ? trim(selected_raw) : std::string();
+	if (selected.empty())
+		return false;
+
+	if (load_saved_playlist_into_settings(settings, selected)) {
+		obs_data_set_string(settings, kSavedPlaylistNameSetting, selected.c_str());
+		rebuild_playlist_selector_property(props, settings);
+		return true;
+	}
+
+	return false;
+}
+
+bool move_playlist_button_clicked(obs_properties_t *props, void *data, int direction)
+{
+	auto *source = static_cast<nowplaylist_source *>(data);
+	if (!source || !source->source)
+		return false;
+
+	obs_data_t *settings = obs_source_get_settings(source->source);
+	if (!settings)
+		return false;
+
+	int64_t selected_after_move = -1;
+	const bool moved = move_selected_playlist_item(settings, direction, &selected_after_move);
+	if (moved) {
+		obs_source_update(source->source, settings);
+		rebuild_playlist_selector_property(props, settings);
+		rebuild_saved_playlists_property(props, settings);
+		obs_data_set_int(settings, kPlaylistSelectedSetting, selected_after_move);
+		sync_editor_from_selected_item(settings);
+	}
+
+	obs_data_release(settings);
+	return moved;
+}
+
+bool on_playlist_move_up_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(property);
+	return move_playlist_button_clicked(props, data, -1);
+}
+
+bool on_playlist_move_down_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(property);
+	return move_playlist_button_clicked(props, data, 1);
+}
+
+bool on_playlist_save_record_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(property);
+
+	auto *source = static_cast<nowplaylist_source *>(data);
+	if (!source || !source->source)
+		return false;
+
+	obs_data_t *settings = obs_source_get_settings(source->source);
+	if (!settings)
+		return false;
+
+	const bool changed = update_selected_playlist_item_metadata(settings);
+	if (changed) {
+		obs_source_update(source->source, settings);
+		rebuild_playlist_selector_property(props, settings);
+		rebuild_saved_playlists_property(props, settings);
+	}
+
+	obs_data_release(settings);
+	return changed;
+}
+
+bool on_playlist_expanded_toggle_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(property);
+
+	auto *source = static_cast<nowplaylist_source *>(data);
+	if (!source || !source->source)
+		return false;
+
+	obs_data_t *settings = obs_source_get_settings(source->source);
+	if (!settings)
+		return false;
+
+	const bool expanded = obs_data_get_bool(settings, kPlaylistExpandedViewSetting);
+	obs_data_set_bool(settings, kPlaylistExpandedViewSetting, !expanded);
+	sync_playlist_preview_text(settings);
+	rebuild_playlist_selector_property(props, settings);
+	rebuild_saved_playlists_property(props, settings);
+
+	obs_data_release(settings);
+	return true;
+}
+
+bool on_saved_playlist_new_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(property);
+
+	auto *source = static_cast<nowplaylist_source *>(data);
+	if (!source || !source->source)
+		return false;
+
+	obs_data_t *settings = obs_source_get_settings(source->source);
+	if (!settings)
+		return false;
+
+	const char *name_raw = obs_data_get_string(settings, kSavedPlaylistNameSetting);
+	const std::string requested_name = name_raw ? trim(name_raw) : std::string();
+	obs_data_t *store = load_saved_playlists_store();
+	const std::string final_name = make_unique_saved_playlist_name(store, requested_name);
+
+	obs_data_array_t *playlist = obs_data_get_array(settings, kPlaylistSetting);
+	const bool changed = write_current_playlist_to_store(store, final_name, playlist, true);
+	if (playlist)
+		obs_data_array_release(playlist);
+
+	if (changed && save_saved_playlists_store(store)) {
+		obs_data_set_string(settings, kSavedPlaylistSelectSetting, final_name.c_str());
+		obs_data_set_string(settings, kSavedPlaylistNameSetting, final_name.c_str());
+		rebuild_saved_playlists_property(props, settings);
+	}
+
+	obs_data_release(store);
+	obs_data_release(settings);
+	return changed;
+}
+
+bool on_saved_playlist_save_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(property);
+
+	auto *source = static_cast<nowplaylist_source *>(data);
+	if (!source || !source->source)
+		return false;
+
+	obs_data_t *settings = obs_source_get_settings(source->source);
+	if (!settings)
+		return false;
+
+	const char *selected_raw = obs_data_get_string(settings, kSavedPlaylistSelectSetting);
+	const char *name_raw = obs_data_get_string(settings, kSavedPlaylistNameSetting);
+	std::string target_name = selected_raw ? trim(selected_raw) : std::string();
+	if (target_name.empty())
+		target_name = name_raw ? trim(name_raw) : std::string();
+
+	if (target_name.empty()) {
+		obs_data_release(settings);
+		return false;
+	}
+
+	obs_data_t *store = load_saved_playlists_store();
+	obs_data_array_t *playlist = obs_data_get_array(settings, kPlaylistSetting);
+	const bool changed = write_current_playlist_to_store(store, target_name, playlist, true);
+	if (playlist)
+		obs_data_array_release(playlist);
+
+	if (changed && save_saved_playlists_store(store)) {
+		obs_data_set_string(settings, kSavedPlaylistSelectSetting, target_name.c_str());
+		obs_data_set_string(settings, kSavedPlaylistNameSetting, target_name.c_str());
+		rebuild_saved_playlists_property(props, settings);
+	}
+
+	obs_data_release(store);
+	obs_data_release(settings);
+	return changed;
+}
+
+bool on_saved_playlist_rename_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(property);
+
+	auto *source = static_cast<nowplaylist_source *>(data);
+	if (!source || !source->source)
+		return false;
+
+	obs_data_t *settings = obs_source_get_settings(source->source);
+	if (!settings)
+		return false;
+
+	const char *selected_raw = obs_data_get_string(settings, kSavedPlaylistSelectSetting);
+	const char *name_raw = obs_data_get_string(settings, kSavedPlaylistNameSetting);
+	const std::string old_name = selected_raw ? trim(selected_raw) : std::string();
+	std::string new_name = name_raw ? trim(name_raw) : std::string();
+	if (old_name.empty() || new_name.empty()) {
+		obs_data_release(settings);
+		return false;
+	}
+	if (new_name == old_name) {
+		obs_data_release(settings);
+		return false;
+	}
+
+	obs_data_t *store = load_saved_playlists_store();
+	new_name = make_unique_saved_playlist_name(store, new_name);
+	const bool renamed = rename_saved_playlist(store, old_name, new_name);
+	if (renamed && save_saved_playlists_store(store)) {
+		obs_data_set_string(settings, kSavedPlaylistSelectSetting, new_name.c_str());
+		obs_data_set_string(settings, kSavedPlaylistNameSetting, new_name.c_str());
+		rebuild_saved_playlists_property(props, settings);
+	}
+
+	obs_data_release(store);
+	obs_data_release(settings);
+	return renamed;
+}
+
+bool on_saved_playlist_export_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+
+	auto *source = static_cast<nowplaylist_source *>(data);
+	if (!source || !source->source)
+		return false;
+
+	obs_data_t *settings = obs_source_get_settings(source->source);
+	if (!settings)
+		return false;
+
+	const char *export_path_raw = obs_data_get_string(settings, kSavedPlaylistExportPathSetting);
+	std::string export_path = export_path_raw ? trim(export_path_raw) : std::string();
+	if (export_path.empty())
+		export_path = module_text_path("playlist-export.json");
+
+	obs_data_t *export_root = obs_data_create();
+	const char *selected_raw = obs_data_get_string(settings, kSavedPlaylistSelectSetting);
+	const std::string selected_name = selected_raw ? trim(selected_raw) : std::string();
+	if (!selected_name.empty())
+		obs_data_set_string(export_root, kSavedPlaylistNameKey, selected_name.c_str());
+
+	obs_data_array_t *playlist = obs_data_get_array(settings, kPlaylistSetting);
+	if (playlist) {
+		obs_data_set_array(export_root, kSavedPlaylistItemsKey, playlist);
+		obs_data_array_release(playlist);
+	}
+
+	const bool exported = obs_data_save_json_pretty_safe(export_root, export_path.c_str(), "tmp", "bak");
+	obs_data_release(export_root);
+	obs_data_release(settings);
+	return exported;
 }
 
 std::string make_child_name(const nowplaylist_source *source, const char *suffix)
@@ -1221,6 +2495,18 @@ void on_child_audio_capture(void *param, obs_source_t *child, const struct audio
 	if (!source || !source->source || !audio_data || !audio_data->frames || muted)
 		return;
 
+	float peak = 0.0f;
+	const uint32_t channels = get_audio_channels(source->output_speakers);
+	for (uint32_t channel = 0; channel < channels && channel < MAX_AV_PLANES; ++channel) {
+		if (!audio_data->data[channel])
+			continue;
+
+		const float *samples = reinterpret_cast<const float *>(audio_data->data[channel]);
+		for (size_t frame = 0; frame < audio_data->frames; ++frame)
+			peak = std::max(peak, std::fabs(samples[frame]));
+	}
+	source->audio_peak.store(peak, std::memory_order_relaxed);
+
 	struct obs_source_audio audio = {};
 	audio.frames = static_cast<uint32_t>(audio_data->frames);
 	audio.speakers = source->output_speakers;
@@ -1236,7 +2522,13 @@ void on_child_audio_capture(void *param, obs_source_t *child, const struct audio
 
 const char *nowplaylist_get_name(void *)
 {
-	return tr_text("NowPlaylisting.SourceName", "NowPlaylisting");
+	static std::string display_name_with_version;
+	if (display_name_with_version.empty()) {
+		display_name_with_version = std::string(tr_text("NowPlaylisting.SourceName", "NowPlaylisting")) + " v" +
+					    NOWPLAYLISTING_VERSION;
+	}
+
+	return display_name_with_version.c_str();
 }
 
 void *nowplaylist_create(obs_data_t *settings, obs_source_t *source_ref)
@@ -1349,6 +2641,13 @@ void nowplaylist_destroy(void *data)
 	if (source->font_settings)
 		obs_data_release(source->font_settings);
 
+	obs_enter_graphics();
+	if (source->media_effect)
+		gs_effect_destroy(source->media_effect);
+	if (source->media_texrender)
+		gs_texrender_destroy(source->media_texrender);
+	obs_leave_graphics();
+
 	delete source;
 }
 
@@ -1372,21 +2671,17 @@ void nowplaylist_video_render(void *data, gs_effect_t *effect)
 	const uint32_t target_width = nowplaylist_get_width(data);
 	const uint32_t target_height = nowplaylist_get_height(data);
 
-	if (source->current_is_video) {
-		render_source_fit_centered(source->media_source, target_width, target_height);
-		return;
+	const motion_state motion = compute_audio_motion(source);
+	ensure_media_render_resources(source);
+
+	if (!render_media_to_texture(source, target_width, target_height, motion)) {
+		render_media_block(source, target_width, target_height);
+	} else {
+		render_media_texture_with_effect(source, target_width, target_height);
 	}
 
-	bool drew_background = false;
-	if (source->album_art_source && obs_source_enabled(source->album_art_source)) {
-		render_source_fit_centered(source->album_art_source, target_width, target_height);
-		drew_background = true;
-	}
-
-	if (!drew_background)
-		render_source_fit_centered(source->media_source, target_width, target_height);
-
-	render_centered_text(source, target_width, target_height);
+	if (!source->current_is_video)
+		render_centered_text(source, target_width, target_height);
 }
 
 void nowplaylist_enum_sources(void *data, obs_source_enum_proc_t enum_callback, void *param)
@@ -1419,11 +2714,42 @@ void nowplaylist_update(void *data, obs_data_t *settings)
 	source->glow_size = static_cast<int>(obs_data_get_int(settings, kGlowSizeSetting));
 	source->offset_x = static_cast<int>(obs_data_get_int(settings, kOffsetXSetting));
 	source->offset_y = static_cast<int>(obs_data_get_int(settings, kOffsetYSetting));
+	source->export_tags_to_files = obs_data_get_bool(settings, kExportTagsEnabledSetting);
+	const char *artist_output_raw = obs_data_get_string(settings, kExportArtistPathSetting);
+	const char *title_output_raw = obs_data_get_string(settings, kExportTitlePathSetting);
+	source->artist_output_file = artist_output_raw ? trim(artist_output_raw) : std::string();
+	source->title_output_file = title_output_raw ? trim(title_output_raw) : std::string();
+	if (source->artist_output_file.empty())
+		source->artist_output_file = module_text_path("current-artist.txt");
+	if (source->title_output_file.empty())
+		source->title_output_file = module_text_path("current-title.txt");
+	source->bounce_intensity =
+		std::clamp(static_cast<int>(obs_data_get_int(settings, kBounceIntensitySetting)), 0, 100);
+	source->shake_intensity =
+		std::clamp(static_cast<int>(obs_data_get_int(settings, kShakeIntensitySetting)), 0, 100);
+	source->media_brightness =
+		map_media_brightness(static_cast<int>(obs_data_get_int(settings, kMediaBrightnessSetting)));
+	source->media_contrast =
+		map_media_contrast(static_cast<int>(obs_data_get_int(settings, kMediaContrastSetting)));
+	source->media_saturation =
+		map_media_saturation(static_cast<int>(obs_data_get_int(settings, kMediaSaturationSetting)));
+	source->media_glow_color = static_cast<uint32_t>(obs_data_get_int(settings, kMediaGlowColorSetting));
+	source->media_glow_size =
+		map_media_glow_size(static_cast<int>(obs_data_get_int(settings, kMediaGlowSizeSetting)));
+	source->media_glow_intensity =
+		map_media_glow_intensity(static_cast<int>(obs_data_get_int(settings, kMediaGlowIntensitySetting)));
+	source->media_vignette_strength =
+		map_media_vignette_strength(static_cast<int>(obs_data_get_int(settings, kMediaVignetteStrengthSetting)));
+	source->media_vignette_roundness =
+		map_media_vignette_roundness(static_cast<int>(obs_data_get_int(settings, kMediaVignetteRoundnessSetting)));
+
 	source->playlist_items = read_and_normalize_playlist_items(settings, source->recursive);
 	rebuild_playlist_runtime_cache(source);
 
 	set_font_settings(source, settings);
 	sync_playlist_and_state(source);
+	update_text_sources(source);
+	sync_current_tag_output_files(source);
 }
 
 void nowplaylist_media_play_pause(void *data, bool pause)
@@ -1493,9 +2819,40 @@ enum obs_media_state nowplaylist_media_get_state(void *data)
 	return source->media_source ? obs_source_media_get_state(source->media_source) : OBS_MEDIA_STATE_NONE;
 }
 
-obs_properties_t *nowplaylist_properties(void *)
+obs_properties_t *nowplaylist_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
+	auto *source = static_cast<nowplaylist_source *>(data);
+	obs_data_t *settings = nullptr;
+	if (source && source->source)
+		settings = obs_source_get_settings(source->source);
+
+	const bool expanded_preview = settings && obs_data_get_bool(settings, kPlaylistExpandedViewSetting);
+
+	obs_property_t *saved_playlist_select =
+		obs_properties_add_list(props, kSavedPlaylistSelectSetting,
+					tr_text("NowPlaylisting.SavedPlaylist", "Saved Playlist"),
+					OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_set_modified_callback2(saved_playlist_select, on_saved_playlist_selected_modified, nullptr);
+	obs_properties_add_text(props, kSavedPlaylistNameSetting,
+				tr_text("NowPlaylisting.SavedPlaylistName", "Playlist Name"), OBS_TEXT_DEFAULT);
+	obs_properties_add_button2(props, kSavedPlaylistNewButton, tr_text("NowPlaylisting.New", "New"),
+				   on_saved_playlist_new_clicked, source);
+	obs_properties_add_button2(props, kSavedPlaylistSaveButton, tr_text("NowPlaylisting.Save", "Save"),
+				   on_saved_playlist_save_clicked, source);
+	obs_properties_add_button2(props, kSavedPlaylistRenameButton, tr_text("NowPlaylisting.Rename", "Rename"),
+				   on_saved_playlist_rename_clicked, source);
+	obs_properties_add_path(props, kSavedPlaylistExportPathSetting,
+				tr_text("NowPlaylisting.ExportPath", "Export Path"), OBS_PATH_FILE_SAVE,
+				"JSON Files (*.json);;All Files (*.*)", nullptr);
+	obs_properties_add_button2(props, kSavedPlaylistExportButton, tr_text("NowPlaylisting.Export", "Export"),
+				   on_saved_playlist_export_clicked, source);
+
+	obs_properties_add_button2(
+		props, kPlaylistExpandedToggleButton,
+		expanded_preview ? tr_text("NowPlaylisting.CollapseRows", "Collapse Extra Rows")
+				  : tr_text("NowPlaylisting.ExpandRows", "Expand Extra Rows"),
+		on_playlist_expanded_toggle_clicked, source);
 
 	obs_property_t *playlist = obs_properties_add_editable_list(
 		props, kPlaylistSetting, tr_text("NowPlaylisting.Playlist", "Playlist"), OBS_EDITABLE_LIST_TYPE_FILES,
@@ -1503,10 +2860,70 @@ obs_properties_t *nowplaylist_properties(void *)
 	obs_property_set_long_description(
 		playlist, tr_text("NowPlaylisting.PlaylistHint",
 				  "Use Add -> Add Files or Add -> Add Folder to build the playlist."));
+	obs_property_set_modified_callback2(playlist, on_playlist_property_modified, nullptr);
 
-	obs_properties_add_bool(props, kRecursiveSetting, tr_text("NowPlaylisting.Recursive", "Scan folders recursively"));
+	obs_properties_add_button2(props, kPlaylistMoveUpButton, tr_text("NowPlaylisting.MoveUp", "Move Up"),
+				   on_playlist_move_up_clicked, source);
+	obs_properties_add_button2(props, kPlaylistMoveDownButton, tr_text("NowPlaylisting.MoveDown", "Move Down"),
+				   on_playlist_move_down_clicked, source);
+
+	obs_property_t *playlist_selected = obs_properties_add_list(
+		props, kPlaylistSelectedSetting, tr_text("NowPlaylisting.PlaylistSelected", "Selected Track"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_set_modified_callback2(playlist_selected, on_playlist_selected_modified, nullptr);
+
+	obs_properties_add_text(props, kPlaylistArtistEditSetting,
+				tr_text("NowPlaylisting.PlaylistArtist", "Artist"), OBS_TEXT_DEFAULT);
+	obs_properties_add_text(props, kPlaylistTitleEditSetting,
+				tr_text("NowPlaylisting.PlaylistTitle", "Title"), OBS_TEXT_DEFAULT);
+	obs_properties_add_bool(
+		props, kPlaylistShowTagsEditSetting, tr_text("NowPlaylisting.PlaylistShowTags", "Show Tags"));
+	obs_properties_add_button2(props, kPlaylistSaveRecordButton,
+				   tr_text("NowPlaylisting.SaveTrack", "Save Selected Track"),
+				   on_playlist_save_record_clicked, source);
+
+	obs_property_t *playlist_preview = obs_properties_add_text(
+		props, kPlaylistPreviewTextSetting, tr_text("NowPlaylisting.PlaylistPreview", "Playlist Preview"),
+		OBS_TEXT_INFO);
+	obs_property_text_set_info_type(playlist_preview, OBS_TEXT_INFO_NORMAL);
+	obs_property_text_set_info_word_wrap(playlist_preview, false);
+
+	obs_property_t *recursive = obs_properties_add_bool(
+		props, kRecursiveSetting, tr_text("NowPlaylisting.Recursive", "Scan folders recursively"));
+	obs_property_set_modified_callback2(recursive, on_playlist_property_modified, nullptr);
 	obs_properties_add_bool(props, kShuffleSetting, tr_text("NowPlaylisting.Shuffle", "Shuffle"));
 	obs_properties_add_bool(props, kLoopSetting, tr_text("NowPlaylisting.Loop", "Loop"));
+	obs_properties_add_bool(props, kExportTagsEnabledSetting,
+				tr_text("NowPlaylisting.ExportTagsToFiles", "Save Current Artist/Title To Text Files"));
+	obs_properties_add_path(props, kExportArtistPathSetting,
+				tr_text("NowPlaylisting.ArtistOutputFile", "Artist Output File"), OBS_PATH_FILE_SAVE,
+				kTextFileFilter, nullptr);
+	obs_properties_add_path(props, kExportTitlePathSetting,
+				tr_text("NowPlaylisting.TitleOutputFile", "Title Output File"), OBS_PATH_FILE_SAVE,
+				kTextFileFilter, nullptr);
+	obs_properties_add_int_slider(props, kBounceIntensitySetting,
+				      tr_text("NowPlaylisting.BounceIntensity", "Bounce Intensity"), 0, 100, 1);
+	obs_properties_add_int_slider(props, kShakeIntensitySetting,
+				      tr_text("NowPlaylisting.CameraShakeIntensity", "Camera Shake Intensity"), 0, 100,
+				      1);
+	obs_properties_add_int_slider(props, kMediaBrightnessSetting,
+				      tr_text("NowPlaylisting.MediaBrightness", "Media Brightness"), -100, 100, 1);
+	obs_properties_add_int_slider(props, kMediaContrastSetting,
+				      tr_text("NowPlaylisting.MediaContrast", "Media Contrast"), -100, 100, 1);
+	obs_properties_add_int_slider(props, kMediaSaturationSetting,
+				      tr_text("NowPlaylisting.MediaSaturation", "Media Saturation"), 0, 300, 1);
+	obs_properties_add_color(props, kMediaGlowColorSetting,
+				 tr_text("NowPlaylisting.MediaGlowColor", "Media Glow Color"));
+	obs_properties_add_int_slider(props, kMediaGlowSizeSetting,
+				      tr_text("NowPlaylisting.MediaGlowSize", "Media Glow Size"), 0, 48, 1);
+	obs_properties_add_int_slider(props, kMediaGlowIntensitySetting,
+				      tr_text("NowPlaylisting.MediaGlowIntensity", "Media Glow Intensity"), 0, 200,
+				      1);
+	obs_properties_add_int_slider(props, kMediaVignetteStrengthSetting,
+				      tr_text("NowPlaylisting.MediaVignetteStrength", "Media Vignette"), 0, 100, 1);
+	obs_properties_add_int_slider(props, kMediaVignetteRoundnessSetting,
+				      tr_text("NowPlaylisting.MediaVignetteRoundness", "Media Vignette Roundness"),
+				      25, 200, 1);
 
 	obs_properties_add_font(props, kFontSetting, tr_text("NowPlaylisting.Font", "Text Font"));
 	obs_properties_add_color(props, kTextColorSetting, tr_text("NowPlaylisting.TextColor", "Text Color"));
@@ -1521,6 +2938,13 @@ obs_properties_t *nowplaylist_properties(void *)
 	obs_properties_add_int(props, kOffsetYSetting, tr_text("NowPlaylisting.OffsetY", "Text Offset Y"), -4096, 4096,
 			       1);
 
+	if (settings) {
+		rebuild_saved_playlists_property(props, settings);
+		rebuild_playlist_selector_property(props, settings);
+		sync_playlist_preview_text(settings);
+		obs_data_release(settings);
+	}
+
 	return props;
 }
 
@@ -1531,8 +2955,36 @@ void nowplaylist_defaults(obs_data_t *settings)
 	obs_data_array_release(playlist);
 
 	obs_data_set_default_bool(settings, kRecursiveSetting, false);
+	obs_data_set_default_int(settings, kPlaylistSelectedSetting, -1);
+	obs_data_set_default_string(settings, kPlaylistArtistEditSetting, "");
+	obs_data_set_default_string(settings, kPlaylistTitleEditSetting, "");
+	obs_data_set_default_bool(settings, kPlaylistShowTagsEditSetting, true);
+	obs_data_set_default_bool(settings, kPlaylistExpandedViewSetting, false);
+	obs_data_set_default_string(settings, kPlaylistPreviewTextSetting, "(playlist is empty)");
+	obs_data_set_default_string(settings, kSavedPlaylistSelectSetting, "");
+	obs_data_set_default_string(settings, kSavedPlaylistNameSetting, "");
+	const std::string default_playlist_export = module_text_path("playlist-export.json");
+	if (!default_playlist_export.empty())
+		obs_data_set_default_string(settings, kSavedPlaylistExportPathSetting, default_playlist_export.c_str());
 	obs_data_set_default_bool(settings, kShuffleSetting, false);
 	obs_data_set_default_bool(settings, kLoopSetting, false);
+	obs_data_set_default_bool(settings, kExportTagsEnabledSetting, false);
+	const std::string default_artist_output = module_text_path("current-artist.txt");
+	const std::string default_title_output = module_text_path("current-title.txt");
+	if (!default_artist_output.empty())
+		obs_data_set_default_string(settings, kExportArtistPathSetting, default_artist_output.c_str());
+	if (!default_title_output.empty())
+		obs_data_set_default_string(settings, kExportTitlePathSetting, default_title_output.c_str());
+	obs_data_set_default_int(settings, kBounceIntensitySetting, kDefaultBounceIntensity);
+	obs_data_set_default_int(settings, kShakeIntensitySetting, kDefaultShakeIntensity);
+	obs_data_set_default_int(settings, kMediaBrightnessSetting, 0);
+	obs_data_set_default_int(settings, kMediaContrastSetting, 0);
+	obs_data_set_default_int(settings, kMediaSaturationSetting, kDefaultMediaSaturation);
+	obs_data_set_default_int(settings, kMediaGlowColorSetting, kDefaultMediaGlowColor);
+	obs_data_set_default_int(settings, kMediaGlowSizeSetting, 0);
+	obs_data_set_default_int(settings, kMediaGlowIntensitySetting, 0);
+	obs_data_set_default_int(settings, kMediaVignetteStrengthSetting, 0);
+	obs_data_set_default_int(settings, kMediaVignetteRoundnessSetting, kDefaultMediaVignetteRoundness);
 	obs_data_set_default_int(settings, kTextColorSetting, kDefaultTextColor);
 	obs_data_set_default_int(settings, kOutlineColorSetting, kDefaultOutlineColor);
 	obs_data_set_default_int(settings, kOutlineSizeSetting, kDefaultOutlineSize);

@@ -1,5 +1,5 @@
 #define MyAppName "NowPlaylisting"
-#define MyAppVersion "0.9.2"
+#define MyAppVersion"1.1.2"
 #define MyAppPublisher "Vizmatic, LLC"
 #define MyAppURL "https://vizmatic.sorryneedboost.com"
 #define SourceDll "build\\RelWithDebInfo\\nowplaylisting.dll"

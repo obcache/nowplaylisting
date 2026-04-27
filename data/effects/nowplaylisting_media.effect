@@ -1,0 +1,86 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float brightness;
+uniform float contrast;
+uniform float saturation;
+uniform float2 texel_size;
+uniform float glow_size;
+uniform float glow_intensity;
+uniform float4 glow_color;
+uniform float vignette_strength;
+uniform float vignette_roundness;
+
+sampler_state textureSampler {
+	Filter = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+VertData VSDefault(VertData vert_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = vert_in.uv;
+	return vert_out;
+}
+
+float sample_alpha(float2 uv)
+{
+	return image.Sample(textureSampler, uv).a;
+}
+
+float4 PSNowPlaylistingMedia(VertData vert_in) : TARGET
+{
+	float4 src = image.Sample(textureSampler, vert_in.uv);
+	float alpha = src.a;
+	float3 rgb = (alpha > 0.0001) ? (src.rgb / alpha) : float3(0.0, 0.0, 0.0);
+
+	rgb = (rgb - 0.5.xxx) * (1.0 + contrast) + 0.5.xxx;
+	rgb += brightness.xxx;
+
+	float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+	rgb = lerp(luma.xxx, rgb, max(saturation, 0.0));
+
+	if (glow_intensity > 0.0001 && glow_size > 0.0001) {
+		float2 radius = texel_size * glow_size;
+		float alpha_sum = 0.0;
+		alpha_sum += sample_alpha(vert_in.uv + float2(radius.x, 0.0));
+		alpha_sum += sample_alpha(vert_in.uv + float2(-radius.x, 0.0));
+		alpha_sum += sample_alpha(vert_in.uv + float2(0.0, radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(0.0, -radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(radius.x, radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(radius.x, -radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(-radius.x, radius.y));
+		alpha_sum += sample_alpha(vert_in.uv + float2(-radius.x, -radius.y));
+		float avg_alpha = alpha_sum / 8.0;
+		float edge = saturate(avg_alpha - alpha);
+		rgb += glow_color.rgb * edge * glow_intensity;
+	}
+
+	if (vignette_strength > 0.0001) {
+		float2 p = vert_in.uv * 2.0 - 1.0;
+		float roundness = max(vignette_roundness, 0.01);
+		p.x /= roundness;
+		float distance_from_center = length(p);
+		float vignette_mask = smoothstep(0.35, 1.0, distance_from_center);
+		rgb *= (1.0 - vignette_strength * vignette_mask);
+	}
+
+	rgb = saturate(rgb);
+	return float4(rgb * alpha, alpha);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader = PSNowPlaylistingMedia(vert_in);
+	}
+}

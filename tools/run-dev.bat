@@ -19,4 +19,4 @@ copy /Y "E:\Production\Coding\nowplaylisting\build\RelWithDebInfo\nowplaylisting
 
 REM Run obs64.exe from the specified directory
 cd /d "C:\Program Files\obs-studio\bin\64bit"
-start obs64.exe
+start obs64.exe 
